@@ -1,3 +1,5 @@
+> Historical design notes. For current MCP connections and saved GUI settings, see [README.md](README.md). Workbook/WebSocket startup instructions below are superseded.
+
 # lapsrv
 
 Lapsrv is a python app that uses an Impinj RFID reader placed about 50m before the finish line to 
@@ -118,7 +120,7 @@ Wave	Cat 1/2/3	Women	100-131	4:40	14	6.1		TRUE	TRUE	TRUE
 ### --CrossMgr-Properties
 ```
 Event Name	Event Organizer	Event City	Event StateProv	Event Country	Event Date	Scheduled Start	TimeZone	Race Number	Race Discipline	Enable RFID	Distance Unit	Time Trial	RFID Option	Use SFTP	FTP Host	FTP User	FTP Password	FTP Path	FTP Upload During Race	GATrackingID	Road Race Finish Times	No Data DNS	Win and Out	Event Long Name	Email	Google Maps API Key
-Murchie Ciruit-1030	Thrashers	Langley	BC	Canada	2026-03-14	10:30	America/Vancouver	1	Road	TRUE	km	FALSE	0	FALSE		sl	EL77PIkiwVsuNzsZjUllFlraWTAf		TRUE	UA-64955454-1	FALSE	TRUE	FALSE	Murchie-1030	drew@oh-water.com	
+Murchie Ciruit-1030	Thrashers	Langley	BC	Canada	2026-03-14	10:30	America/Vancouver	1	Road	TRUE	km	FALSE	0	FALSE		sl	<FTP_PASSWORD>		TRUE	UA-64955454-1	FALSE	TRUE	FALSE	Murchie-1030	drew@oh-water.com	<GOOGLE_MAPS_API_KEY>
 ```
 
 ## Usage

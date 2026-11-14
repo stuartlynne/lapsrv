@@ -7,6 +7,7 @@ import bisect
 import csv
 import datetime as dt
 import json
+import hashlib
 import logging
 import math
 import os
@@ -34,10 +35,9 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 from openpyxl.workbook.properties import CalcProperties
-import websockets
 
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 CR = "\r"
 CR_BYTES = b"\r"
@@ -434,6 +434,8 @@ class SharedState:
         }
         self.ip_health: dict[str, IPHealthStatus] = {}
         self.warning_enabled = True
+        self.mcp_required=False;self.mcp_ready=False;self.mcp_detail="";self.mcp_source={};self.mcp_last_success=None;self.mcp_race_start=None;self.mcp_max_age=15.0
+        self.subsystems["mcp"]=SubsystemStatus(name="CrossMgr MCP")
         self.tt_export_path: Optional[Path] = None
         self.tt_xlsx_path: Optional[Path] = None
         self.tt_exported_keys: set[str] = set()
@@ -445,6 +447,81 @@ class SharedState:
         self.road_exported_keys: set[str] = set()
         self.road_exported_read_times: dict[str, list[float]] = {}
         self.road_exported_recorded_keys: set[str] = set()
+
+    def mcp_is_ready(self):
+        return not self.mcp_required or bool(self.mcp_ready and self.mcp_last_success and time.time()-self.mcp_last_success<=self.mcp_max_age)
+
+    def invalidate_mcp(self,detail):
+        with self.lock:
+            self.mcp_ready=False;self.mcp_detail=str(detail);self.race_clock_wall=None
+            for key in ('mcp','announcer','lapcounter'):
+                self.set_subsystem_status(key,'error',detail=str(detail))
+
+    def apply_mcp(self,snapshot):
+        from lapsrv_mcp import epc,race_epoch,source_key
+        roster=snapshot['roster'];review=snapshot['review'];settings=snapshot['settings']
+        target=settings['targets'][settings['selected_target']]
+        cfg=RaceConfig();cfg.event_name=roster.get('name','');cfg.event_date=roster.get('date','');cfg.timezone=target['timezone'];cfg.time_trial=bool(roster.get('is_time_trial'))
+        meta={c['name']:c for c in roster.get('categories',[])}
+        source_rows={str(r['bib']):r for r in roster.get('rows',[])}
+        results={};category_results={}
+        for row in review.get('rows',[]):category_results.setdefault(row['category'],[]).append(row)
+        for name,category in meta.items():
+            members=[r for r in source_rows.values() if name in r.get('categories',[]) or r.get('category')==name]
+            parent=next((meta.get(r.get('category'),{}) for r in members if meta.get(r.get('category'),{}).get('wave')),category)
+            cfg.categories[name]=CategoryConfig(name=name,race_laps=category.get('laps') or parent.get('laps'),race_distance=category.get('distance') or parent.get('distance'),start_offset=category.get('start_offset') or parent.get('start_offset',''),category_type='Wave' if category.get('wave') else 'Component')
+        assigned={};ambiguous=set()
+        for bib,row in source_rows.items():
+            components=[name for name in row.get('categories',[]) if name in meta and not meta[name].get('wave')]
+            category=components[0] if len(components)==1 else row.get('category','')
+            rider=RiderInfo(bib=bib,first_name=str(row.get('first_name') or ''),last_name=str(row.get('last_name') or ''),team=str(row.get('team') or ''),category=category)
+            cfg.riders_by_bib[bib]=rider
+            for raw in row.get('tags',{}).values():
+                tag=epc(raw)
+                if not tag:continue
+                if tag in assigned and assigned[tag].bib!=bib:ambiguous.add(tag)
+                else:assigned[tag]=rider
+                if not rider.tag:rider.tag=tag
+            wave_rows=[r for r in category_results.get(row.get('category'),[]) if str(r['bib'])==bib]
+            result=wave_rows[0] if wave_rows else next((r for r in review.get('rows',[]) if str(r['bib'])==bib),{})
+            times=[float(t) for t in result.get('calculated_times',[])]
+            flags=[bool(f) for f in result.get('calculated_interpolation',[])]
+            if not cfg.time_trial:
+                offset=parse_clock_seconds(result.get('start_offset')) or 0
+                observed=[float(p['seconds']) for p in result.get('passings',[])]
+                actual=[t for i,t in enumerate(times) if i and i<len(flags) and not flags[i]]
+                match=lambda shift:sum(any(abs(t+shift-p)<.00001 for p in observed) for t in actual)
+                if offset and match(offset)>match(0):times=[t+offset for t in times]
+            results[bib]=dict(raceTimes=times,interp=flags,status=result.get('status','NP'),startTime=result.get('first_time') or 0,
+                categoryName=category,category=category)
+        cfg.riders_by_tag={tag:rider for tag,rider in assigned.items() if tag not in ambiguous}
+        details={}
+        for i,(name,category) in enumerate(cfg.categories.items()):
+            ranked=sorted(category_results.get(name,[]),key=lambda r:int(re.match(r'\d+',str(r.get('position','')))[0]) if re.match(r'\d+',str(r.get('position',''))) else 999999)
+            pos=[str(r['bib']) for r in ranked]
+            pos+= [bib for bib,r in source_rows.items() if bib not in pos and (name in r.get('categories',[]) or r.get('category')==name)]
+            details[name]=dict(name=name,pos=pos,laps=category.race_laps,iSort=i,catType=category.category_type,lapDistance=category.race_distance)
+        start=race_epoch(roster.get('start_time_utc') or roster.get('start_time'),cfg.timezone,target.get('timezone_file',''));finish=race_epoch(roster.get('finish_time_utc') or roster.get('finish_time'),cfg.timezone,target.get('timezone_file',''))
+        identity=(source_key(settings),snapshot['origin'].get('race_path'),roster.get('start_time'))
+        with self.lock:
+            if identity!=getattr(self,'mcp_identity',None):
+                self._reset_for_new_race_locked();self.reference={};self._last_cur_race_time=None;self._last_version_count=None
+            self.mcp_identity=identity;self.config=cfg;self.results_by_bib=results;self.category_details=details
+            self.latest_lap_refresh={};self.mcp_race_start=start
+            value=None if start is None else max(0,(finish if roster.get('state')=='finished' and finish is not None else time.time())-start)
+            self.reference=dict(curRaceTime=value,isTimeTrial=cfg.time_trial)
+            self.race_clock_value=value;self.race_clock_wall=time.time() if start is not None and roster.get('state')=='running' and settings['mode']=='current' else None
+            self.mcp_ready=True;self.mcp_last_success=time.time();self.mcp_detail=(f'{len(ambiguous)} ambiguous EPC assignments omitted' if ambiguous else '')
+            self.mcp_source=dict(target=settings['selected_target'],mode=settings['mode'],race_path=snapshot['origin'].get('race_path'),state=roster.get('state'),participants=len(cfg.riders_by_bib),tags=len(cfg.riders_by_tag))
+            self.subsystems['announcer'].name='MCP riders';self.subsystems['lapcounter'].name='MCP laps'
+            for key in ('mcp','announcer','lapcounter'):self.set_subsystem_status(key,'connected',endpoint=settings['selected_target'],detail=self.mcp_detail)
+            self.last_announcer_update=self.last_lapcounter_update=dt.datetime.now().astimezone()
+            self._refresh_rider_runtime_from_announcer()
+            base=Path(getattr(self,'mcp_export_dir',settings['export_dir'])).expanduser()
+            origin=snapshot['origin'].get('race_path','race');scope=hashlib.sha256(json.dumps([target['url'],target.get('tool_names',{}),origin,roster.get('start_time_utc') or roster.get('start_time')],sort_keys=True).encode()).hexdigest()[:10]
+            name=(re.sub(r'[^A-Za-z0-9_.-]+','-',cfg.event_date+'-'+Path(origin).stem).strip('-') or 'race')+'-'+scope
+            self.tt_export_path=base/(name+'-tt-results.csv');self.tt_xlsx_path=base/(name+'-tt-results.xlsx')
+            self.road_export_path=base/(name+'-road-passings.csv');self.road_xlsx_path=base/(name+'-road-passings.xlsx')
 
     def effective_category_config(self, category: str) -> CategoryConfig:
         base = self.config.categories.get(category, CategoryConfig(name=category))
@@ -507,7 +584,7 @@ class SharedState:
                 updated_at=status.updated_at,
                 detail=status.detail,
             )
-            timeout = STATUS_TIMEOUTS.get(key)
+            timeout = self.mcp_max_age if self.mcp_required and key in ("mcp","announcer","lapcounter") else STATUS_TIMEOUTS.get(key)
             if timeout and effective.updated_at and effective.state == "connected":
                 age = (dt.datetime.now().astimezone() - effective.updated_at).total_seconds()
                 if age > timeout:
@@ -1072,12 +1149,13 @@ class SharedState:
         return DISTANCE_TO_FINISH_METERS / speed
 
     def record_passing(self, tag: str, seen_at: dt.datetime, reader: str = "") -> Optional[PassingRecord]:
-        tag = tag.strip().upper()
+        from lapsrv_mcp import epc
+        tag = epc(tag)
         received_at = dt.datetime.now().astimezone()
         self.set_subsystem_status("rfid", "connected", detail=reader or tag)
         with self.lock:
-            rider = self.config.riders_by_tag.get(tag)
-            current_race_time = self.current_race_time()
+            rider = self.config.riders_by_tag.get(tag) if self.mcp_is_ready() else None
+            current_race_time = self.current_race_time() if self.mcp_is_ready() else None
             race_time = None
             if current_race_time is not None:
                 if self.race_clock_wall is not None:
@@ -1085,6 +1163,7 @@ class SharedState:
                 else:
                     race_time = current_race_time
 
+            if self.mcp_required and self.mcp_is_ready() and self.mcp_race_start is not None:race_time=max(0,seen_at.timestamp()-self.mcp_race_start)
             if rider:
                 if self.is_time_trial() and race_time is not None:
                     start_offset = self.tt_start_offset(rider.bib)
@@ -1848,6 +1927,7 @@ class SharedState:
                 self.update_road_exports()
                 tt_active_rows, tt_completed_rows = [], []
             return {
+                "mcp": dict(self.mcp_source,ready=self.mcp_is_ready(),detail=self.mcp_detail,last_success=self.mcp_last_success),
                 "event_name": self.config.event_name,
                 "event_date": self.config.event_date,
                 "timezone": self.config.timezone,
@@ -1972,7 +2052,7 @@ class JChipServer:
                 line = raw[:-1].decode(errors="ignore").strip()
                 if not line:
                     continue
-                self.logger.warning("reader rx: %s %s", reader_name, line)
+                self.logger.debug("reader rx: %s %s", reader_name, line)
                 if line.startswith("N"):
                     reader_name = line[5:].strip() or reader_name
                     self.logger.info("reader identified: %s", reader_name)
@@ -2038,81 +2118,6 @@ class JChipServer:
             if task is not None:
                 self.client_tasks.discard(task)
             self.logger.info("reader disconnected: %s", reader_name)
-
-
-class CrossMgrClient:
-    def __init__(self, state: SharedState, host: str, port: int) -> None:
-        self.state = state
-        self.host = host
-        self.port = port
-        self.logger = logging.getLogger("lapsrv.crossmgr")
-        self.stop_event = asyncio.Event()
-        self._announcer_ws: Any = None
-        self._lapcounter_ws: Any = None
-
-    async def run(self) -> None:
-        await asyncio.gather(
-            self._run_announcer(),
-            self._run_lapcounter(),
-        )
-
-    async def stop(self) -> None:
-        self.stop_event.set()
-        for ws in (self._announcer_ws, self._lapcounter_ws):
-            if ws is not None:
-                try:
-                    await asyncio.wait_for(ws.close(), timeout=1.0)
-                except Exception:
-                    pass
-
-    async def _run_announcer(self) -> None:
-        url = f"ws://{self.host}:{self.port + 1}/"
-        while not self.stop_event.is_set():
-            try:
-                self.logger.info("connecting announcer websocket %s", url)
-                self.state.set_subsystem_status("announcer", "waiting", endpoint=self.host)
-                async with websockets.connect(url, open_timeout=5, ping_interval=None) as ws:
-                    self._announcer_ws = ws
-                    self.state.set_subsystem_status("announcer", "connected", endpoint=self.host)
-                    await ws.send(json.dumps({"cmd": "send_baseline", "raceName": "CurrentResults"}))
-                    async for raw in ws:
-                        if self.stop_event.is_set():
-                            break
-                        msg = json.loads(raw)
-                        if msg.get("cmd") in {"baseline", "ram"}:
-                            self.state.update_announcer(msg)
-                self._announcer_ws = None
-            except asyncio.CancelledError:
-                self._announcer_ws = None
-                raise
-            except Exception as exc:
-                self.logger.warning("announcer websocket error: %s", exc)
-                self.state.set_subsystem_status("announcer", "error", endpoint=self.host, detail=str(exc))
-                await asyncio.sleep(5)
-
-    async def _run_lapcounter(self) -> None:
-        url = f"ws://{self.host}:{self.port + 2}/"
-        while not self.stop_event.is_set():
-            try:
-                self.logger.info("connecting lapcounter websocket %s", url)
-                self.state.set_subsystem_status("lapcounter", "waiting", endpoint=self.host)
-                async with websockets.connect(url, open_timeout=5, ping_interval=None) as ws:
-                    self._lapcounter_ws = ws
-                    self.state.set_subsystem_status("lapcounter", "connected", endpoint=self.host)
-                    async for raw in ws:
-                        if self.stop_event.is_set():
-                            break
-                        msg = json.loads(raw)
-                        if msg.get("cmd") == "refresh":
-                            self.state.update_lapcounter(msg)
-                self._lapcounter_ws = None
-            except asyncio.CancelledError:
-                self._lapcounter_ws = None
-                raise
-            except Exception as exc:
-                self.logger.warning("lapcounter websocket error: %s", exc)
-                self.state.set_subsystem_status("lapcounter", "error", endpoint=self.host, detail=str(exc))
-                await asyncio.sleep(5)
 
 
 class PingMonitor:
@@ -2204,10 +2209,11 @@ class PingMonitor:
 
 
 class WebServer:
-    def __init__(self, state: SharedState, host: str, port: int) -> None:
+    def __init__(self, state: SharedState, host: str, port: int, settings_api=None) -> None:
         self.state = state
         self.host = host
         self.port = port
+        self.settings_api=settings_api
         self.app = web.Application()
         self.runner: Optional[web.AppRunner] = None
         self.site: Optional[web.TCPSite] = None
@@ -2215,6 +2221,7 @@ class WebServer:
         self._routes()
 
     def _routes(self) -> None:
+        if self.settings_api:self.settings_api.routes(self.app)
         self.app.router.add_get("/", self.handle_index)
         self.app.router.add_get("/category/{name}", self.handle_category)
         self.app.router.add_get("/api/state", self.handle_state)
@@ -2914,6 +2921,7 @@ body.tt-min-mode .tt-table col.tt-col-time {{
       <h1 id="event" style="margin:0;font-size:1.1rem;line-height:1.1;">lapsrv</h1>
     </div>
     <div class="toolbar">
+      <a href="/settings" style="padding:.5rem;">Settings</a><span id="sourceStatus"></span>
       <div class="tt-indicator" id="ttIndicator" style="display:none;">TT</div>
       <button class="tt-min-toggle" id="ttMinToggle" type="button" style="display:none;">TTMin Off</button>
       <button class="warning-toggle" id="warningToggle" type="button" style="display:none;">Warning On</button>
@@ -3452,6 +3460,8 @@ async function refresh() {{
   ipHealthBar.innerHTML = ipHealthHtml(data.ip_health || []);
   updateWarningButton(!!data.warning_enabled, (data.ip_health || []).length > 0);
   const subsystems = data.subsystems || {{}};
+  const source = data.mcp || {{}};
+  document.getElementById('sourceStatus').textContent = source.ready ? `${{source.target || ''}} · ${{source.mode || ''}} · ${{source.state || ''}}` : 'CrossMgr unavailable: ' + (source.detail || 'connecting');
   const recentGroupTable = data.recent_group_table || {{headers: [], header_status: {{}}, rows: []}};
   window.__recentGroupTable = recentGroupTable;
   recentGroupRowsWrap.innerHTML = groupTableHtml(recentGroupTable);
@@ -3477,9 +3487,10 @@ setInterval(refresh, 1000);
 
 
 class TkMonitor:
-    def __init__(self, state: SharedState, on_close: Optional[callable] = None) -> None:
+    def __init__(self, state: SharedState, on_close: Optional[callable] = None, settings_store=None,on_settings=None) -> None:
         self.state = state
         self.on_close = on_close
+        self.settings_store=settings_store;self.on_settings=on_settings
         self.thread: Optional[threading.Thread] = None
         self.logger = logging.getLogger("lapsrv.tk")
         self._closed = False
@@ -3495,12 +3506,16 @@ class TkMonitor:
     def _run(self) -> None:
         root = tk.Tk()
         root.title("lapsrv")
-        root.geometry("1400x900")
+        root.geometry(self.settings_store.snapshot()["ui_geometry"] if self.settings_store else "1400x900")
 
         def handle_close() -> None:
             if self._closed:
                 return
             self._closed = True
+            if self.settings_store:
+                try:
+                    data,revision=self.settings_store.read();data["ui_geometry"]=root.geometry();self.settings_store.save(data,expected_revision=revision)
+                except Exception:self.logger.exception("Could not retain window geometry")
             if self._after_id is not None:
                 try:
                     root.after_cancel(self._after_id)
@@ -3523,8 +3538,13 @@ class TkMonitor:
 
         root.protocol("WM_DELETE_WINDOW", handle_close)
 
+        if self.settings_store:
+            from lapsrv_settings import tk_settings
+            ttk.Button(root,text="Settings…",command=lambda:tk_settings(root,self.settings_store,self.on_settings)).pack(anchor="ne",padx=8,pady=4)
         header = ttk.Label(root, text="lapsrv", font=("TkDefaultFont", 18, "bold"))
         header.pack(fill="x", padx=8, pady=(8, 4))
+        source_detail = ttk.Label(root, text="Connecting to CrossMgr…", wraplength=1300)
+        source_detail.pack(fill="x", padx=8, pady=(0, 4))
 
         ip_frame = tk.Frame(root)
         ip_frame.pack(fill="x", padx=8, pady=(0, 4))
@@ -3576,7 +3596,7 @@ class TkMonitor:
             snap = self.state.snapshot()
             subsystems = snap.get("subsystems", {})
             status_parts = []
-            for key in ("rfid", "announcer", "lapcounter"):
+            for key in ("rfid", "mcp"):
                 sub = subsystems.get(key)
                 if not sub:
                     continue
@@ -3584,6 +3604,13 @@ class TkMonitor:
                 status_parts.append(f"{sub['name']} [{sub['state']}]{{{endpoint.strip()}}}" if endpoint else f"{sub['name']} [{sub['state']}]")
             status_text = "   ".join(status_parts)
             header.config(text=f"{snap['event_name'] or 'lapsrv'}    Race {snap['current_race_time'] or ''}    {status_text}")
+            source=snap.get('mcp',{})
+            if self.settings_store:
+                settings=self.settings_store.snapshot();name=settings['selected_target']
+                endpoint=settings['targets'][name]['url']
+                detail=source.get('detail') or ('Connected' if source.get('ready') else 'Connecting or waiting for a fresh CrossMgr response')
+                source_detail.config(text=f'CrossMgr: {name} · {endpoint} — {detail}',foreground='#166534' if source.get('ready') else '#b91c1c')
+            else:source_detail.config(text=source.get('detail',''))
             for child in ip_frame.winfo_children():
                 child.destroy()
             for item in snap.get("ip_health", []):
@@ -3704,23 +3731,41 @@ class TkMonitor:
 
 
 class LapsrvApp:
-    def __init__(self, args: argparse.Namespace) -> None:
-        self.args = args
-        self.config = RaceConfig.load(Path(args.xlsx))
-        self.state = SharedState(self.config, show_unknown_tags=args.show_unknown_tags)
-        self.state.tt_export_path = Path(args.xlsx).with_name(Path(args.xlsx).stem + '-tt-results.csv')
-        self.state.tt_xlsx_path = Path(args.xlsx).with_name(Path(args.xlsx).stem + '-tt-results.xlsx')
-        self.state.road_export_path = Path(args.xlsx).with_name(Path(args.xlsx).stem + '-road-passings.csv')
-        self.state.road_xlsx_path = Path(args.xlsx).with_name(Path(args.xlsx).stem + '-road-passings.xlsx')
-        self.jchip = JChipServer(self.state, args.listen_host, args.port)
-        self.crossmgr = CrossMgrClient(self.state, args.crossmgr_host, args.crossmgr_port)
-        self.web = WebServer(self.state, args.web_host, args.web)
-        self.ping = PingMonitor(self.state, list(args.ip_address or []))
-        self.loop: Optional[asyncio.AbstractEventLoop] = None
-        self.tk = TkMonitor(self.state, on_close=self.request_stop)
-        self.stop_event = asyncio.Event()
-        self.logger = logging.getLogger("lapsrv.app")
-        print(f"race mode: {'tt' if self.config.time_trial else 'road'}", file=sys.stderr, flush=True)
+    def __init__(self, args: argparse.Namespace,store=None) -> None:
+        from lapsrv_config import SettingsStore
+        from lapsrv_mcp import MCPMonitor,source_key
+        from lapsrv_settings import SettingsWeb
+        self.args=args;self.store=store or SettingsStore(args.config);self.started_settings=self.store.snapshot()
+        self.state=SharedState(RaceConfig(),show_unknown_tags=self.started_settings['show_unknown_tags']);self.state.mcp_required=True
+        self.state.mcp_export_dir=self.started_settings['export_dir']
+        self.jchip=JChipServer(self.state,self.started_settings['listen_host'],self.started_settings['port'])
+        self.crossmgr=MCPMonitor(self.state,self.store);self.active_source_key=source_key(self.started_settings)
+        self.settings_api=SettingsWeb(self.store,self.started_settings,self.settings_changed,self.refresh_mcp)
+        self.web=WebServer(self.state,self.started_settings['web_host'],self.started_settings['web'],self.settings_api)
+        self.ping=PingMonitor(self.state,self.started_settings['ip_address'])
+        self.loop=None;self.tk=TkMonitor(self.state,on_close=self.request_stop,settings_store=self.store,on_settings=self.settings_changed)
+        self.stop_event=asyncio.Event();self.logger=logging.getLogger('lapsrv.app')
+        self.store.admin_token()
+        self.settings_changed()
+
+    def settings_changed(self):
+        def apply():
+            global GROUP_GAP_SECONDS,GROUP_MAX_AGE_SECONDS
+            from lapsrv_mcp import source_key
+            data=self.store.snapshot();key=source_key(data)
+            if key!=self.active_source_key:
+                self.active_source_key=key;self.state.invalidate_mcp('Switching CrossMgr source; waiting for identity data')
+            with self.state.lock:
+                self.state.show_unknown_tags=data['show_unknown_tags'];self.state.mcp_max_age=max(15,data['poll_seconds']*3)
+            GROUP_GAP_SECONDS=data['group_gap_seconds'];GROUP_MAX_AGE_SECONDS=data['group_max_age_seconds']
+            logging.getLogger().setLevel(data['log_level'].upper());self.crossmgr.force=True;self.crossmgr.wake.set()
+        if self.loop:self.loop.call_soon_threadsafe(apply)
+        else:apply()
+
+    def refresh_mcp(self):
+        def refresh():self.crossmgr.force=True;self.crossmgr.wake.set()
+        if self.loop:self.loop.call_soon_threadsafe(refresh)
+        else:refresh()
 
     def request_stop(self) -> None:
         self.logger.info("shutdown requested")
@@ -3771,7 +3816,7 @@ class LapsrvApp:
                 self.logger.warning("shutdown: timed out waiting for background tasks")
             await self._stop_with_timeout("web", self.web.stop())
             await self._stop_with_timeout("jchip", self.jchip.stop())
-            if self.config.time_trial:
+            if self.state.config.time_trial:
                 try:
                     exported = self.state.export_tt_xlsx()
                     if exported:
@@ -3789,74 +3834,66 @@ class LapsrvApp:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=f"lapsrv {__version__} early-read monitor for CrossMgr races")
-    parser.add_argument("--xlsx", required=True, help="CrossMgr XLSX configuration file")
-    parser.add_argument("--crossmgr", default="localhost:8765", help="CrossMgr host[:port], default localhost:8765")
-    parser.add_argument("--port", type=int, default=DEFAULT_JCHIP_PORT, help=f"JChip listen port, default {DEFAULT_JCHIP_PORT}")
-    parser.add_argument("--web", type=int, default=DEFAULT_WEB_PORT, help=f"Web UI port, default {DEFAULT_WEB_PORT}")
-    parser.add_argument("--listen-host", "--listen_host", default="0.0.0.0", help="JChip listen host, default 0.0.0.0")
-    parser.add_argument("--web-host", "--web_host", default="0.0.0.0", help="Web listen host, default 0.0.0.0")
-    parser.add_argument("--ip-address", "--ip_address", nargs="*", default=[], dest="ip_address", help="Up to three IP addresses to ping once per second")
-    parser.add_argument(
-        "--group-gap-seconds",
-        "--group_gap_seconds",
-        type=float,
-        default=GROUP_GAP_SECONDS,
-        help=f"Gap in seconds that starts a new group, default {GROUP_GAP_SECONDS}",
-    )
-    parser.add_argument(
-        "--group-max-age-seconds",
-        "--group_max_age_seconds",
-        type=float,
-        default=GROUP_MAX_AGE_SECONDS,
-        dest="group_max_age_seconds",
-        help=f"Maximum age in seconds to retain a group, default {GROUP_MAX_AGE_SECONDS}",
-    )
-    parser.add_argument("--group-max_age-seconds", type=float, dest="group_max_age_seconds", help=argparse.SUPPRESS)
-    parser.add_argument("--no-gui", "--no_gui", action="store_true", help="Disable the tkinter window")
-    parser.add_argument(
-        "--show-unknown-tags",
-        "--show_unknown_tags",
-        action="store_true",
-        dest="show_unknown_tags",
-        help="Show unknown tags using the first 12 EPC characters; otherwise ignore them",
-    )
-    parser.add_argument("--log-level", "--log_level", default="INFO", help="Logging level, default INFO")
+    parser=argparse.ArgumentParser(description=f'lapsrv {__version__}: early-reader heads-up, read-only CrossMgr MCP')
+    parser.add_argument('--config',help='Saved settings JSON (default ~/.config/lapsrv/settings.json)')
+    parser.add_argument('--target',help='Select a named CrossMgr MCP profile')
+    parser.add_argument('--mcp-url',help='MCP HTTP endpoint; overrides selected profile this run')
+    parser.add_argument('--token-file',help='Bearer-token file on this host')
+    parser.add_argument('--instance',help='Explicit CrossMgr GUI instance')
+    parser.add_argument('--mode',choices=['current','saved'])
+    parser.add_argument('--saved-race-path',help='Saved CMN path on the MCP host')
+    parser.add_argument('--save-config',action='store_true',help='Persist explicit CLI overrides')
+    for field in ('port','web'):
+        parser.add_argument('--'+field,type=int,default=None)
+    for field in ('listen_host','web_host','export_dir','log_level'):
+        parser.add_argument('--'+field.replace('_','-'),'--'+field,default=None)
+    parser.add_argument('--ip-address','--ip_address',nargs='*',default=None)
+    for field in ('group_gap_seconds','group_max_age_seconds','poll_seconds'):
+        parser.add_argument('--'+field.replace('_','-'),'--'+field,type=float,default=None)
+    parser.add_argument('--no-gui','--no_gui',action='store_true',default=None)
+    parser.add_argument('--gui',dest='no_gui',action='store_false')
+    parser.add_argument('--show-unknown-tags','--show_unknown_tags',action=argparse.BooleanOptionalAction,default=None)
+    parser.add_argument('--xlsx',help=argparse.SUPPRESS);parser.add_argument('--crossmgr',help=argparse.SUPPRESS)
     return parser
 
 
-async def async_main(args: argparse.Namespace) -> None:
-    app = LapsrvApp(args)
+def configure(args,parser=None):
+    from lapsrv_config import SettingsStore,validate,DEFAULTS,TARGET_DEFAULTS
+    if args.xlsx or args.crossmgr:raise ValueError('Workbook/WebSocket inputs were replaced by MCP. Use --mcp-url or configure /settings; no --xlsx is required.')
+    store=SettingsStore(args.config);base=store.snapshot()
+    if not store.path.exists():store.save(base)
+    data=store.snapshot()
+    if args.target:
+        if args.target not in data['targets']:
+            if not args.mcp_url:raise ValueError('Unknown target; add it in Settings or supply --mcp-url')
+            data['targets'][args.target]=dict(TARGET_DEFAULTS)
+        data['selected_target']=args.target
+    for arg,field in [('mcp_url','url'),('token_file','token_file'),('instance','instance')]:
+        value=getattr(args,arg)
+        if value is not None:data['targets'][data['selected_target']][field]=value
+    for field in DEFAULTS:
+        value=getattr(args,field,None)
+        if value is not None:data[field]=value
+    data=validate(data)
+    if args.save_config:store.save(data)
+    else:store.data=data
+    for field,value in data.items():setattr(args,field,value)
+    return store
+
+
+async def async_main(args: argparse.Namespace,store=None) -> None:
+    app=LapsrvApp(args,store)
     await app.run()
 
 
 def main() -> None:
-    global GROUP_GAP_SECONDS, GROUP_MAX_AGE_SECONDS
-    parser = build_arg_parser()
-    args = parser.parse_args()
-    args.crossmgr_host, args.crossmgr_port = parse_host_port(args.crossmgr, DEFAULT_CROSSMGR_PORT)
-    if len(args.ip_address) > 3:
-        parser.error("--ip_address accepts at most 3 addresses")
-    if args.group_gap_seconds < 0:
-        parser.error("--group-gap-seconds must be >= 0")
-    if args.group_max_age_seconds <= 0:
-        parser.error("--group-max-age-seconds must be > 0")
-
-    GROUP_GAP_SECONDS = float(args.group_gap_seconds)
-    GROUP_MAX_AGE_SECONDS = float(args.group_max_age_seconds)
-
-    logging.basicConfig(
-        level=getattr(logging, str(args.log_level).upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    logging.getLogger("websockets").setLevel(logging.WARNING)
-    logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
-
-    try:
-        asyncio.run(async_main(args))
-    except KeyboardInterrupt:
-        pass
+    parser=build_arg_parser();args=parser.parse_args()
+    try:store=configure(args,parser)
+    except (ValueError,OSError) as exc:parser.error(str(exc))
+    logging.basicConfig(level=getattr(logging,args.log_level.upper()),format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+    logging.getLogger('aiohttp.access').setLevel(logging.WARNING)
+    try:asyncio.run(async_main(args,store))
+    except KeyboardInterrupt:pass
 
 
-if __name__ == "__main__":
-    main()
+if __name__=='__main__':main()

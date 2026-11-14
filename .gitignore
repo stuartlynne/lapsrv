@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.venv/
+artifacts/
+
+# Local race inputs/exports and office lock files
+*.xlsx
+*-results.csv
+*-passings.csv
+.~lock.*#
+
+# Local diagnostics, credentials and editor backups
+.codex
+stderr.txt*
+*-save[0-9]*
+*.token
+*.env
+.env
+
+# Machine-local reference links, not portable project dependencies
+/Announcer.html
+/LapCounter.html
+/CrossMgrServer.py
+/JChip.py
+/Omada_Network_Application_*
